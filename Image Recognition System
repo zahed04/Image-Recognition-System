@@ -1,0 +1,180 @@
+# app.py
+import os
+import io
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
+from PIL import Image
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications.mobilenet_v2 import (
+    MobileNetV2,
+    preprocess_input,
+    decode_predictions,
+)
+
+# ---------- Configuration ----------
+UPLOAD_DIR = Path("uploads")
+DB_PATH = "predictions.db"
+ALLOWED_EXT = {"png", "jpg", "jpeg"}
+MAX_CONTENT_LENGTH = 6 * 1024 * 1024  # 6 MB upload limit
+TOP_K = 5
+
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+# ---------- Flask app ----------
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+
+# ---------- Database (SQLite) ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            predicted TEXT,
+            confidence REAL,
+            raw_predictions TEXT,
+            created_at TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ---------- Load model (MobileNetV2 pre-trained on ImageNet) ----------
+# For production/use with custom classes, replace with your saved model.
+MODEL = MobileNetV2(weights="imagenet")
+MODEL_INPUT_SHAPE = (224, 224)  # MobileNetV2 default
+
+# ---------- Helpers ----------
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+
+def read_image_from_file(storage_file) -> Image.Image:
+    # Read into PIL Image (ensures consistent mode)
+    image_bytes = storage_file.read()
+    pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return pil
+
+def preprocess_for_model(pil_img: Image.Image) -> np.ndarray:
+    img = pil_img.resize(MODEL_INPUT_SHAPE)
+    arr = np.array(img).astype("float32")
+    arr = np.expand_dims(arr, axis=0)  # batch dim
+    arr = preprocess_input(arr)  # MobileNetV2 preprocessing
+    return arr
+
+def predict_top_k(pil_img: Image.Image, k=TOP_K):
+    inp = preprocess_for_model(pil_img)
+    preds = MODEL.predict(inp)  # shape (1, 1000)
+    decoded = decode_predictions(preds, top=k)[0]  # list of tuples
+    # decode_predictions gives tuples: (class_id, class_name, score)
+    results = [{"label": label, "description": desc, "score": float(score)} for (_, desc, score), label, desc in zip(decoded, [d[0] for d in decoded], [d[1] for d in decoded])]
+    # However, above zip duplication is awkward; simpler below:
+    results = [{"label": item[0], "description": item[1], "score": float(item[2])} for item in decoded]
+    return results, preds.tolist()  # return raw preds for debugging/logging
+
+def log_prediction(filename: str, top_prediction: dict, raw_preds_json: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO predictions (filename, predicted, confidence, raw_predictions, created_at) VALUES (?, ?, ?, ?, ?)",
+        (
+            filename,
+            f"{top_prediction['description']} ({top_prediction['label']})",
+            top_prediction["score"],
+            raw_preds_json,
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+# ---------- Routes ----------
+INDEX_HTML = """
+<!doctype html>
+<title>Image Recognition Demo</title>
+<h1>Image Recognition System (MobileNetV2 - demo)</h1>
+<form method=post enctype=multipart/form-data action="/predict">
+  <input type=file name=image accept="image/*">
+  <input type=submit value="Upload & Predict">
+</form>
+<p>Upload an image (jpg/png). Demo uses MobileNetV2 pretrained on ImageNet.</p>
+<div id="result">{{ result | safe }}</div>
+"""
+
+@app.get("/")
+def index():
+    return render_template_string(INDEX_HTML, result="")
+
+@app.post("/predict")
+def predict():
+    if "image" not in request.files:
+        return jsonify({"error": "no image file provided"}), 400
+    file = request.files["image"]
+    if file.filename == "":
+        return jsonify({"error": "empty filename"}), 400
+    if not allowed_file(file.filename):
+        return jsonify({"error": f"file type not allowed. Allowed: {ALLOWED_EXT}"}), 400
+
+    # Read image and run prediction
+    try:
+        pil_img = read_image_from_file(file)
+    except Exception as e:
+        return jsonify({"error": "failed to read image", "details": str(e)}), 400
+
+    results, raw_preds = predict_top_k(pil_img, k=TOP_K)
+
+    # Save uploaded file with timestamp prefix
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S%f")
+    ext = file.filename.rsplit(".", 1)[1].lower()
+    save_name = f"{timestamp}.{ext}"
+    save_path = UPLOAD_DIR / save_name
+    pil_img.save(save_path)
+
+    # Log top prediction
+    top = results[0] if results else {"description": "unknown", "score": 0.0}
+    import json
+    log_prediction(save_name, top, json.dumps(raw_preds))
+
+    # If request wants HTML (form submit), render page with results; otherwise JSON
+    if request.content_type and request.content_type.startswith("multipart/form-data"):
+        # Show simple results in the index page
+        pretty = "<ul>"
+        for r in results:
+            pretty += f"<li>{r['description']} ({r['label']}): {r['score']:.4f}</li>"
+        pretty += "</ul>"
+        pretty += f'<p>Saved upload: <a href="/uploads/{save_name}">{save_name}</a></p>'
+        return render_template_string(INDEX_HTML, result=pretty)
+
+    return jsonify({"predictions": results, "saved_as": str(save_path)})
+
+@app.get("/uploads/<filename>")
+def uploaded_file(filename):
+    return send_from_directory(UPLOAD_DIR, filename)
+
+@app.get("/stats")
+def stats():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM predictions")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT filename, predicted, confidence, created_at FROM predictions ORDER BY id DESC LIMIT 20")
+    rows = cur.fetchall()
+    conn.close()
+    recent = [
+        {"filename": r[0], "predicted": r[1], "confidence": r[2], "created_at": r[3]} for r in rows
+    ]
+    return {"total_predictions": total, "recent": recent}
+
+# ---------- Run ----------
+if __name__ == "__main__":
+    # For development only. Use Gunicorn for production.
+    app.run(host="0.0.0.0", port=8000, debug=True)
