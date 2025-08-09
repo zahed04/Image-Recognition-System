@@ -149,3 +149,4 @@ Code to convert model to TensorFlow Lite for edge deployment.
 
 OUTPUT:
 
+<img width="1024" height="1024" alt="Image" src="https://github.com/user-attachments/assets/a6e211d4-5deb-41fa-868b-2492c8adc6d5" />
